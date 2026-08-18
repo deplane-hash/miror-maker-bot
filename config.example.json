@@ -1,0 +1,27 @@
+{
+  "freedns": {
+    "username": "YOUR_FREEDNS_USERNAME",
+    "password": "YOUR_FREEDNS_PASSWORD",
+    "host": "freedns.afraid.org",
+    "login_url": "https://freedns.afraid.org/",
+    "registry_url": "https://freedns.afraid.org/domain/registry/",
+    "page_min": 168,
+    "page_max": 190,
+    "subdomain": "freedomhub",
+    "destination": "5.45.110.86"
+  },
+  "discord": {
+    "token": "SELFBOT_TOKEN",
+    "bot_token": "BOT_TOKEN",
+    "bot_application_id": "BOT_APPLICATION_ID",
+    "application_id": "SELFBOT_APPLICATION_ID",
+    "channel_id": "CHANNEL_WHERE_SELFBOT_RUNS_CHECK",
+    "guild_id": "GUILD_ID",
+    "notify_channel_id": "CHANNEL_FOR_MIRROR_NOTIFICATIONS",
+    "owner_id": "YOUR_DISCORD_USER_ID"
+  },
+  "behavior": {
+    "register_one_per_run": true,
+    "timeout_ms": 90000
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "freedns-unblocker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Automated freedns.afraid.org unblocked-domain registration via Discord selfbot",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js-selfbot-v13": "^3.1.5"
+  }
+}

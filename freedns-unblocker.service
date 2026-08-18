@@ -1,0 +1,19 @@
+[Unit]
+Description=FreedomHub mirror bot (freedns.unblocker)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/freedns-unblocker
+Environment=FH_DIR=/root/freedns-unblocker
+Environment=FH_CODE_FILE=/root/code.txt
+ExecStart=/usr/bin/node /root/freedns-unblocker/botv14/bot.js
+Restart=always
+RestartSec=5
+StandardOutput=append:/tmp/botv14.log
+StandardError=append:/tmp/botv14.log
+
+[Install]
+WantedBy=multi-user.target

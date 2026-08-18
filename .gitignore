@@ -1,0 +1,12 @@
+config.json
+node_modules/
+registered.txt
+accounts.json
+account_state.json
+captcha.png
+cookies.txt
+*.log
+__pycache__/
+news_pending.json
+news_snapshot.json
+err.txt
