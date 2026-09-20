@@ -7,6 +7,7 @@ const {
 const { spawnSync, spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const { createLineReader, parseScrapeResponse } = require("../bot-utils");
 
 const cfg = require("../config.json");
 const DIR = path.join(__dirname, "..");
@@ -18,9 +19,14 @@ const checkerJs = path.join(DIR, "checker.js");
 const checkerAllJs = path.join(DIR, "checker_all.js");
 const registerDiscordPy = path.join(DIR, "register_discord.py");
 const createAccountPy = path.join(DIR, "create_account.py");
-const CODE_FILE = process.env.FH_CODE_FILE || "/root/code.txt";
-const NOTIFY_CHANNEL_ID = cfg.discord.notify_channel_id || "1538166114595377183";
-const OWNER_ID = cfg.discord.owner_id || "1335356263986499604";
+const CODE_FILE = process.env.FH_CODE_FILE || path.join(DIR, "code.txt");
+const TARGET_SUBDOMAIN = (cfg.freedns && cfg.freedns.subdomain) || "freedomhub";
+const DESTINATION = (cfg.freedns && cfg.freedns.destination) || "5.45.110.86";
+const NOTIFY_CHANNEL_ID = cfg.discord.notify_channel_id || process.env.FH_NOTIFY_CHANNEL_ID || "";
+const OWNER_ID = cfg.discord.owner_id || process.env.FH_OWNER_ID || "";
+const CHECK_TIMEOUT_MS = Number(cfg.behavior && cfg.behavior.timeout_ms) > 0
+  ? Number(cfg.behavior.timeout_ms)
+  : 90000;
 
 const TOKEN = cfg.discord.bot_token;
 const CLIENT_ID = cfg.discord.bot_application_id;
@@ -42,27 +48,40 @@ function saveRegistered(set) {
 // ---------- freedns account rotation ----------
 // Pool: accounts with stored cookies first, then any cookie-less accounts, then config creds.
 function accountPool() {
-  const withCookie = [];
-  const withoutCookie = [];
+  const accounts = new Map();
+  const add = (account) => {
+    const username = typeof account?.username === "string" ? account.username.trim() : "";
+    const password = typeof account?.password === "string" ? account.password : "";
+    if (!username || !password) return;
+    const entry = { username, password };
+    if (typeof account.cookie === "string" && account.cookie.trim()) entry.cookie = account.cookie.trim();
+    const existing = accounts.get(username);
+    // If a duplicate entry exists, keep the one with a usable cookie.
+    if (!existing || (!existing.cookie && entry.cookie)) accounts.set(username, entry);
+  };
   try {
     if (fs.existsSync(ACCOUNTS_FILE)) {
-      const accounts = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, "utf8"));
-      for (const a of accounts) {
-        if (a && a.username && a.password) {
-          const entry = { username: a.username, password: a.password };
-          if (a.cookie) { entry.cookie = a.cookie; withCookie.push(entry); }
-          else withoutCookie.push(entry);
-        }
-      }
+      const sourceAccounts = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, "utf8"));
+      if (!Array.isArray(sourceAccounts)) throw new Error("accounts.json must contain an array");
+      for (const account of sourceAccounts) add(account);
     }
   } catch (e) {
     console.error("[accounts] failed to load accounts.json:", e.message);
   }
-  return [...withCookie, ...withoutCookie, { username: cfg.freedns.username, password: cfg.freedns.password }];
+  add(cfg.freedns || {});
+  const pool = [...accounts.values()].sort((left, right) => Number(Boolean(right.cookie)) - Number(Boolean(left.cookie)));
+  if (pool.length === 0) throw new Error("No valid freeDNS accounts configured");
+  return pool;
 }
 function loadAccountState() {
   try {
-    if (fs.existsSync(ACCT_STATE_FILE)) return JSON.parse(fs.readFileSync(ACCT_STATE_FILE, "utf8"));
+    if (fs.existsSync(ACCT_STATE_FILE)) {
+      const value = JSON.parse(fs.readFileSync(ACCT_STATE_FILE, "utf8"));
+      return {
+        index: Number.isInteger(value.index) && value.index >= 0 ? value.index : 0,
+        failed: Array.isArray(value.failed) ? value.failed.filter((name) => typeof name === "string") : [],
+      };
+    }
   } catch (e) {}
   return { index: 0, failed: [] };
 }
@@ -73,11 +92,18 @@ function saveAccountState(state) {
 function currentAccount() {
   const pool = accountPool();
   const state = loadAccountState();
-  let idx = Math.min(state.index, pool.length - 1);
+  const start = Number.isInteger(state.index) && state.index >= 0 ? state.index % pool.length : 0;
+  let idx = start;
   let guard = 0;
   while (state.failed.includes(pool[idx].username) && guard < pool.length) {
     idx = (idx + 1) % pool.length;
     guard++;
+  }
+  if (guard >= pool.length) {
+    // A previous run may have exhausted the pool. Start a fresh rotation so
+    // a transient failure does not disable the bot forever.
+    resetAccountFailures();
+    return pool[start];
   }
   return pool[idx];
 }
@@ -96,49 +122,79 @@ function resetAccountFailures() {
 }
 function runPy(args) {
   const res = spawnSync("python3", [freednsPy, ...args], {
-    stdio: ["ignore", "pipe", "ignore"],
-    timeout: 90000,
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: CHECK_TIMEOUT_MS,
     env: { ...process.env, FH_DIR: DIR },
   });
   if (res.error) throw res.error;
+  if (res.status !== 0) {
+    const detail = res.stderr.toString().trim().split("\n").pop() || `exit code ${res.status}`;
+    throw new Error(`scraper failed: ${detail}`);
+  }
   return res.stdout.toString();
 }
+
+function pageSequence(pageMin, pageMax) {
+  const min = Number(pageMin);
+  const max = Number(pageMax);
+  if (!Number.isInteger(min) || !Number.isInteger(max) || min < 1 || max < min) {
+    throw new Error("freedns.page_min/page_max must be a valid ascending page range");
+  }
+  const start = min + Math.floor(Math.random() * (max - min + 1));
+  return [
+    ...Array.from({ length: max - start + 1 }, (_, offset) => start + offset),
+    ...Array.from({ length: start - min }, (_, offset) => min + offset),
+  ];
+}
+
 // Check domains via the selfbot; streams results and stops at the first
 // unblocked domain. Resolves with the candidate that was unblocked, or null.
 function linewizeCheckFirst(candidates, onStatus) {
   return new Promise((resolve, reject) => {
     const urls = candidates.map((c) => c.url || `http://www.${c.domain}/`);
     const proc = spawn("node", [checkerJs, ...urls]);
-    proc.stdout.on("data", (buf) => {
-      for (const line of buf.toString().split("\n")) {
-        const l = line.trim();
-        if (l.startsWith("FOUND_FIRST\t")) {
-          const url = l.split("\t")[1];
-          const cand = candidates.find((c) => (c.url || `http://www.${c.domain}/`) === url);
-          proc.kill();
-          resolve(cand);
-          return;
-        }
-        if (l.startsWith("RESULT\t")) {
-          const parts = l.split("\t");
-          if (onStatus) onStatus(`Checked ${parts[1]}: ${parts[2]}`);
-        }
+    let settled = false;
+    let hard;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      if (hard) clearTimeout(hard);
+      resolve(value);
+    };
+    const handleStdout = (l) => {
+      if (l.startsWith("FOUND_FIRST\t")) {
+        const url = l.split("\t")[1];
+        const cand = candidates.find((c) => (c.url || `http://www.${c.domain}/`) === url);
+        proc.kill();
+        finish(cand || null);
+        return;
+      }
+      if (l.startsWith("RESULT\t")) {
+        const parts = l.split("\t");
+        if (onStatus) onStatus(`Checked ${parts[1] || "?"}: ${parts[2] || "unknown"}`);
+      }
+    };
+    const stdout = createLineReader(handleStdout);
+    const stderr = createLineReader((l) => { if (onStatus) onStatus(l); });
+    proc.stdout.on("data", stdout.push);
+    proc.stderr.on("data", stderr.push);
+    proc.on("error", (error) => {
+      if (!settled) {
+        settled = true;
+        if (hard) clearTimeout(hard);
+        reject(error);
       }
     });
-    proc.stderr.on("data", (buf) => {
-      for (const line of buf.toString().split("\n")) {
-        const l = line.trim();
-        if (l) onStatus(l);
-      }
+    proc.on("close", () => {
+      stdout.flush();
+      stderr.flush();
+      finish(null);
     });
-    proc.on("error", reject);
-    proc.on("exit", (code) => resolve(null));
     // Hard safety: never let the check hang forever.
-    const hard = setTimeout(() => {
+    hard = setTimeout(() => {
       proc.kill();
-      resolve(null);
-    }, (cfg.behavior.timeout_ms || 90000) + 15000);
-    proc.on("exit", () => clearTimeout(hard));
+      finish(null);
+    }, CHECK_TIMEOUT_MS + 15000);
   });
 }
 
@@ -161,7 +217,7 @@ function waitForCaptchaText(interaction, authorId) {
         captchaResolver = { authorId, resolve, reject, timer: setTimeout(() => {
           captchaResolver = null;
           reject(new Error("Timed out waiting for captcha input"));
-        }, cfg.behavior.timeout_ms) };
+        }, CHECK_TIMEOUT_MS) };
       })
       .catch(reject);
   });
@@ -171,27 +227,47 @@ function waitForCaptchaText(interaction, authorId) {
 function registerWithCaptcha(interaction, authorId, domainId, domain) {
   return new Promise((resolve, reject) => {
     const acct = currentAccount();
-    const args = [domainId, domain, acct.username, acct.password];
+    const args = [domainId, domain, acct.username, acct.password, DESTINATION, TARGET_SUBDOMAIN];
     const proc = spawn("python3", [registerDiscordPy, ...args], { env: { ...process.env, FH_DIR: DIR, FH_CODE_FILE: CODE_FILE } });
     let settled = false;
-    proc.stdout.on("data", async (buf) => {
-      for (const line of buf.toString().trim().split("\n")) {
-        const l = line.trim();
-        if (l === "CAPTCHA_READY" && !settled) {
-          try {
-            await waitForCaptchaText(interaction, authorId);
-          } catch (e) {
-            settled = true; proc.kill(); reject(e);
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const handleLine = async (l) => {
+      if (l === "CAPTCHA_READY" && !settled) {
+        try {
+          await waitForCaptchaText(interaction, authorId);
+        } catch (e) {
+          if (!settled) {
+            settled = true;
+            proc.kill();
+            reject(e);
           }
         }
-        if (l.startsWith("RESULT") && !settled) {
-          settled = true; proc.kill(); resolve(l);
-        }
       }
+      if (l.startsWith("RESULT") && !settled) {
+        proc.kill();
+        finish(l);
+      }
+    };
+    const stdout = createLineReader((l) => {
+      handleLine(l).catch((error) => {
+        if (!settled) {
+          settled = true;
+          proc.kill();
+          reject(error);
+        }
+      });
     });
+    proc.stdout.on("data", stdout.push);
     proc.stderr.on("data", () => {});
     proc.on("error", (e) => { if (!settled) { settled = true; reject(e); } });
-    proc.on("exit", (code) => { if (!settled) { settled = true; resolve("RESULT: python_exit_" + code); } });
+    proc.on("close", (code) => {
+      stdout.flush();
+      if (!settled) finish("RESULT: python_exit_" + code);
+    });
   });
 }
 
@@ -201,16 +277,18 @@ function registerWithCaptcha(interaction, authorId, domainId, domain) {
 async function createOneMirror(interaction, registered) {
   // Scan pages until we find unregistered domains, starting from a random page.
   const { page_min, page_max } = cfg.freedns;
-  const startPage = page_min + Math.floor(Math.random() * (page_max - page_min + 1));
   let candidates = [];
   let page = null;
-  const pages = [];
-  for (let p = startPage; p <= page_max; p++) pages.push(p);
-  for (let p = page_min; p < startPage; p++) pages.push(p);
-  for (const p of pages) {
-    const scrapeOut = runPy(["scrape", String(p)]);
-    const scrape = JSON.parse(scrapeOut.trim().split("\n").pop());
-    candidates = scrape.domains.filter((d) => !registered.has(d.domain));
+  for (const p of pageSequence(page_min, page_max)) {
+    let scrape;
+    try {
+      scrape = parseScrapeResponse(runPy(["scrape", String(p)]));
+    } catch (error) {
+      console.error(`[scrape] page ${p} failed:`, error.message);
+      await interaction.editReply(`Skipped page ${p}: ${error.message}`);
+      continue;
+    }
+    candidates = scrape.domains.filter((d) => d && d.domain && d.domain_id && !registered.has(d.domain));
     await interaction.editReply(`Scanned page ${p}: ${candidates.length} unregistered domains.`);
     if (candidates.length > 0) { page = p; break; }
   }
@@ -235,17 +313,23 @@ async function createOneMirror(interaction, registered) {
     const acct = currentAccount();
     if (attempts.has(acct.username)) break;
     attempts.add(acct.username);
-    await interaction.editReply(`UNBLOCKED: ${cand.domain} - registering freedomhub.${cand.domain} -> 5.45.110.86 (account: ${acct.username})`);
+    await interaction.editReply(`UNBLOCKED: ${cand.domain} - registering ${TARGET_SUBDOMAIN}.${cand.domain} -> ${DESTINATION || "configured destination"} (account: ${acct.username})`);
     result = await registerWithCaptcha(interaction, interaction.user.id, cand.domain_id, cand.domain);
     if (result.includes("RESULT: OK")) {
       registered.add(cand.domain);
       saveRegistered(registered);
-      const url = `http://freedomhub.${cand.domain}`;
-      const channel = client.channels.cache.get(NOTIFY_CHANNEL_ID);
-      if (channel) {
-        channel.send(`MIRROR MADE: ${url}`).catch((e) => console.error("[notify] send failed:", e.message));
+      const url = `http://${TARGET_SUBDOMAIN}.${cand.domain}`;
+      if (NOTIFY_CHANNEL_ID) {
+        const channel = client.channels.cache.get(NOTIFY_CHANNEL_ID);
+        if (channel) {
+          channel.send(`MIRROR MADE: ${url}`).catch((e) => console.error("[notify] send failed:", e.message));
+        } else {
+          client.channels.fetch(NOTIFY_CHANNEL_ID)
+            .then((ch) => ch.send(`MIRROR MADE: ${url}`))
+            .catch((e) => console.error("[notify] fetch/send failed:", e.message));
+        }
       } else {
-        client.channels.fetch(NOTIFY_CHANNEL_ID).then((ch) => ch.send(`MIRROR MADE: ${url}`)).catch((e) => console.error("[notify] fetch/send failed:", e.message));
+        console.warn("[notify] no notify channel configured; mirror URL was not posted");
       }
       clearCaptchaImage(interaction);
       return url;
@@ -298,30 +382,44 @@ function createAccount(interaction) {
   return new Promise((resolve, reject) => {
     const proc = spawn("python3", [createAccountPy], { env: { ...process.env, FH_DIR: DIR, FH_CODE_FILE: CODE_FILE, FH_MAIL_DB: process.env.FH_MAIL_DB } });
     let settled = false;
-    proc.stdout.on("data", async (buf) => {
-      for (const line of buf.toString().trim().split("\n")) {
-        const l = line.trim();
-        console.log("[create_account]", l);
-        if (l.startsWith("STATUS:")) {
-          await interaction.editReply("Account: " + l.slice(7)).catch(() => {});
-        }
-        if (l.startsWith("CAPTCHA_READY")) {
-          const [, username, email] = l.split("\t");
-          try {
-            await interaction.editReply(`Creating freedns account ${username} (${email})...`);
-            await waitForCaptchaText(interaction, interaction.user.id);
-          } catch (e) {
-            settled = true; proc.kill(); reject(e);
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const handleLine = async (l) => {
+      console.log("[create_account]", l);
+      if (l.startsWith("STATUS:")) {
+        await interaction.editReply("Account: " + l.slice(7)).catch(() => {});
+      }
+      if (l.startsWith("CAPTCHA_READY") && !settled) {
+        const [, username, email] = l.split("\t");
+        try {
+          await interaction.editReply(`Creating freedns account ${username} (${email})...`);
+          await waitForCaptchaText(interaction, interaction.user.id);
+        } catch (e) {
+          if (!settled) {
+            settled = true;
+            proc.kill();
+            reject(e);
           }
         }
-        if (l.startsWith("RESULT") && !settled) {
-          settled = true; proc.kill(); resolve(l);
-        }
       }
-    });
-    proc.stderr.on("data", (buf) => console.log("[create_account stderr]", buf.toString()));
+      if (l.startsWith("RESULT") && !settled) {
+        proc.kill();
+        finish(l);
+      }
+    };
+    const stdout = createLineReader((l) => { handleLine(l).catch((e) => { if (!settled) { settled = true; reject(e); } }); });
+    const stderr = createLineReader((l) => console.log("[create_account stderr]", l));
+    proc.stdout.on("data", stdout.push);
+    proc.stderr.on("data", stderr.push);
     proc.on("error", (e) => { if (!settled) { settled = true; reject(e); } });
-    proc.on("exit", (code) => { if (!settled) { settled = true; resolve("RESULT: python_exit_" + code); } });
+    proc.on("close", (code) => {
+      stdout.flush();
+      stderr.flush();
+      if (!settled) finish("RESULT: python_exit_" + code);
+    });
   });
 }
 
@@ -357,7 +455,7 @@ async function runNewAccount(interaction) {
 
 async function runLinks(interaction) {
   const domains = loadRegistered();
-  const urls = [...domains].sort().map((d) => `http://freedomhub.${d}`);
+  const urls = [...domains].sort().map((d) => `http://${TARGET_SUBDOMAIN}.${d}`);
   if (urls.length === 0) {
     return interaction.editReply("No mirrors registered yet.");
   }
@@ -374,17 +472,26 @@ function runCheckAll(urls) {
   return new Promise((resolve) => {
     const proc = spawn("node", [checkerAllJs, ...urls]);
     const results = [];
-    proc.stdout.on("data", (buf) => {
-      for (const line of buf.toString().split("\n")) {
-        const l = line.trim();
-        if (!l.startsWith("RESULT\t")) continue;
-        const parts = l.split("\t");
-        results.push({ url: parts[1], status: parts[2] });
-      }
+    let settled = false;
+    let timer;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(results);
+    };
+    const stdout = createLineReader((l) => {
+      if (!l.startsWith("RESULT\t")) return;
+      const parts = l.split("\t");
+      if (parts[1] && parts[2]) results.push({ url: parts[1], status: parts[2] });
     });
-    proc.on("error", () => resolve(results));
-    proc.on("exit", () => resolve(results));
-    setTimeout(() => { proc.kill(); resolve(results); }, (cfg.behavior.timeout_ms || 90000) * urls.length + 30000);
+    proc.stdout.on("data", stdout.push);
+    proc.on("error", finish);
+    proc.on("close", () => {
+      stdout.flush();
+      finish();
+    });
+    timer = setTimeout(() => { proc.kill(); finish(); }, CHECK_TIMEOUT_MS * urls.length + 30000);
   });
 }
 
@@ -393,7 +500,7 @@ async function runScheduledCheck() {
   healthCheckRunning = true;
   try {
     const domains = loadRegistered();
-    const urls = [...domains].sort().map((d) => `http://freedomhub.${d}`);
+    const urls = [...domains].sort().map((d) => `http://${TARGET_SUBDOMAIN}.${d}`);
     if (urls.length === 0) {
       console.log("[health] no mirrors registered, skipping");
       return;
@@ -403,6 +510,10 @@ async function runScheduledCheck() {
     const working = results.filter((r) => r.status === "not_blocked").map((r) => r.url);
     const blocked = results.filter((r) => r.status === "blocked").length;
     const unknown = results.filter((r) => r.status === "unknown").length;
+    if (!NOTIFY_CHANNEL_ID) {
+      console.warn("[health] no notify channel configured; skipping health report");
+      return;
+    }
     const channel = client.channels.cache.get(NOTIFY_CHANNEL_ID) ||
       (await client.channels.fetch(NOTIFY_CHANNEL_ID).catch(() => null));
     if (!channel) {
