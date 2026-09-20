@@ -2,7 +2,7 @@
 """Long-running registration helper for the Discord bot.
 
 Flow: login (via saved cookie or fresh creds) -> fetch captcha -> print CAPTCHA_READY
-      -> poll /root/code.txt -> submit -> print RESULT line.
+      -> poll the configured code file -> submit -> print RESULT line.
 Captcha and submission share ONE requests.Session.
 """
 import json
