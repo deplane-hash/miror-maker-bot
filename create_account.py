@@ -4,7 +4,7 @@
 Driven by the Discord bot (same captcha flow as registration):
   1. generate username/password, create mailbox <user>@freedomhub.at
   2. GET /signup/ -> save captcha.png -> print CAPTCHA_READY
-  3. poll /root/code.txt for the user's captcha code
+  3. poll the configured code file for the user's captcha code
   4. POST signup -> poll mail.db for activation email -> click link
   5. print RESULT line; append credentials to accounts.json
 """
@@ -25,7 +25,7 @@ MAIL_DB = os.environ.get("FH_MAIL_DB", "/var/lib/freedomhub/mail.db")
 DIR = os.environ.get("FH_DIR", "/root/freedns-unblocker")
 OUT = os.path.join(DIR, "accounts.json")
 CAP_FILE = os.path.join(DIR, "captcha.png")
-CODE_FILE = os.environ.get("FH_CODE_FILE", "/root/code.txt")
+CODE_FILE = os.environ.get("FH_CODE_FILE", os.path.join(BASE_DIR, "code.txt"))
 
 
 def log(msg):
