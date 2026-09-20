@@ -98,9 +98,9 @@ Environment overrides (optional):
 | Var             | Default                        | Purpose                         |
 |-----------------|--------------------------------|---------------------------------|
 | `FH_DIR`        | `/root/freedns-unblocker`      | project directory               |
-| `FH_CODE_FILE`  | `/root/code.txt`               | captcha answer file             |
+| `FH_CODE_FILE`  | `<project>/code.txt`           | captcha answer file             |
 | `FH_MAIL_DB`    | `/var/lib/freedomhub/mail.db`  | mailbox DB for account creation |
-| `FH_FALLBACK_COOKIE` | (built-in)                 | cookie when no account matches  |
+| `FH_FALLBACK_COOKIE` | unset                    | optional emergency cookie; never bundled in source |
 
 ## Accounts (`accounts.json`)
 
@@ -114,7 +114,8 @@ Each entry stores freeDNS credentials plus a verified `dns_cookie`:
 
 - `set_cookie.py USERNAME COOKIE` adds a cookie for an account.
 - The bot prefers cookie-bearing accounts (freeDNS blocks fresh logins
-  from repeated server IPs).
+  from repeated server IPs). If every account was marked failed in a
+  previous run, the next run automatically starts a fresh rotation.
 - Account rotation state is kept in `account_state.json`.
 
 ## /newaccount (optional)
