@@ -2,7 +2,7 @@
 """Long-running registration helper for the Discord bot.
 
 Flow: login (via saved cookie or fresh creds) -> fetch captcha -> print CAPTCHA_READY
-      -> poll /root/code.txt -> submit -> print RESULT line.
+      -> poll the configured code file -> submit -> print RESULT line.
 Captcha and submission share ONE requests.Session.
 """
 import json
@@ -21,12 +21,13 @@ DOMAIN = sys.argv[2] if len(sys.argv) > 2 else "unknown"
 USERNAME = sys.argv[3] if len(sys.argv) > 3 else None
 PASSWORD = sys.argv[4] if len(sys.argv) > 4 else None
 DESTINATION = sys.argv[5] if len(sys.argv) > 5 else "5.45.110.86"
-CODE_FILE = os.environ.get("FH_CODE_FILE", "/root/code.txt")
+SUBDOMAIN = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] else "freedomhub"
+CODE_FILE = os.environ.get("FH_CODE_FILE", os.path.join(BASE_DIR, "code.txt"))
 DIR = BASE_DIR
 BASE = "https://freedns.afraid.org"
-FALLBACK_COOKIE = os.environ.get("FH_FALLBACK_COOKIE", "jBhDpQQp4UgAp465ONu")
+FALLBACK_COOKIE = os.environ.get("FH_FALLBACK_COOKIE", "").strip()
 MAX_SUBDOMAINS = 5
-TARGET_SUBDOMAIN = "freedomhub." + DOMAIN
+TARGET_SUBDOMAIN = SUBDOMAIN + "." + DOMAIN
 
 if os.path.exists(CODE_FILE):
     os.remove(CODE_FILE)
@@ -68,8 +69,10 @@ def login_session():
             timeout=30,
         )
         return freedns._is_logged_in(s)
-    s.cookies.set("dns_cookie", FALLBACK_COOKIE, domain="freedns.afraid.org", path="/")
-    return freedns._is_logged_in(s)
+    if FALLBACK_COOKIE:
+        s.cookies.set("dns_cookie", FALLBACK_COOKIE, domain="freedns.afraid.org", path="/")
+        return freedns._is_logged_in(s)
+    return False
 
 
 if not login_session():
@@ -108,7 +111,7 @@ def submit(code):
         BASE + "/subdomain/save.php?step=2",
         data={
             "type": "A",
-            "subdomain": "freedomhub",
+            "subdomain": SUBDOMAIN,
             "domain_id": DOMAIN_ID,
             "address": DESTINATION,
             "ttlalias": "",
